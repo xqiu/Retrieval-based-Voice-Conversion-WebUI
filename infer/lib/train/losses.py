@@ -56,3 +56,52 @@ def kl_loss(z_p, logs_q, m_p, logs_p, z_mask):
     kl = torch.sum(kl * z_mask)
     l = kl / torch.sum(z_mask)
     return l
+
+def normalize_embeddings(embeddings):
+    """
+    Normalizes embeddings to unit vectors.
+
+    Args:
+        embeddings (torch.Tensor): Embeddings to normalize. Shape: [batch_size, embedding_dim]
+
+    Returns:
+        torch.Tensor: Normalized embeddings.
+    """
+    return F.normalize(embeddings, p=2, dim=1)
+
+def speaker_embedding_loss(generated_embeddings, real_embeddings, margin=0.0):
+    """
+    Computes the Cosine Embedding Loss between generated and real speaker embeddings.
+
+    Args:
+        generated_embeddings (torch.Tensor): Embeddings from generated audio. Shape: [batch_size, embedding_dim]
+        real_embeddings (torch.Tensor): Embeddings from real audio. Shape: [batch_size, embedding_dim]
+        margin (float): Margin for cosine embedding loss.
+
+    Returns:
+        torch.Tensor: Scalar loss value.
+    """
+    # Infer device from the generated embeddings
+    device = generated_embeddings.device
+
+    # Create target tensor on the same device
+    target = torch.ones(generated_embeddings.size(0)).to(device)  # Labels: 1 for similar pairs
+
+    # Compute Cosine Embedding Loss
+    loss = F.cosine_embedding_loss(generated_embeddings, real_embeddings, target, margin=margin)
+    return loss
+
+# Phoneme Consistency Loss
+def phoneme_consistency_loss(real_phoneme_features, generated_phoneme_features):
+    """
+    Computes the L1 loss between phoneme features of real and generated audio.
+
+    Args:
+        real_phoneme_features (torch.Tensor): Phoneme-level acoustic features of real audio.
+        generated_phoneme_features (torch.Tensor): Phoneme-level acoustic features of generated audio.
+
+    Returns:
+        torch.Tensor: Phoneme consistency loss.
+    """
+    loss = F.l1_loss(generated_phoneme_features, real_phoneme_features)
+    return loss

@@ -2,6 +2,9 @@ import os
 import sys
 import logging
 
+# Set up logging before other imports
+logging.basicConfig(level=logging.INFO)
+
 logger = logging.getLogger(__name__)
 
 now_dir = os.getcwd()
@@ -17,6 +20,7 @@ n_gpus = len(hps.gpus.split("-"))
 from random import randint, shuffle
 
 import torch
+import torch.multiprocessing as mp
 
 try:
     import intel_extension_for_pytorch as ipex  # pylint: disable=import-error, unused-import
@@ -72,12 +76,20 @@ from infer.lib.train.losses import (
     feature_loss,
     generator_loss,
     kl_loss,
+    speaker_embedding_loss,
+    normalize_embeddings,
+    phoneme_consistency_loss,
 )
 from infer.lib.train.mel_processing import mel_spectrogram_torch, spec_to_mel_torch
 from infer.lib.train.process_ckpt import savee
 
-global_step = 0
+from resemblyzer import VoiceEncoder
+import numpy as np
 
+from fairseq.models.hubert import HubertModel
+from fairseq.checkpoint_utils import load_model_ensemble_and_task
+
+global_step = 0
 
 class EpochRecorder:
     def __init__(self):
@@ -262,6 +274,18 @@ def run(rank, n_gpus, hps, logger: logging.Logger):
 
     scaler = GradScaler(enabled=hps.train.fp16_run)
 
+    # Initialize phoneme_recognizer, using hubert_base_ls960 from https://dl.fbaipublicfiles.com/hubert/hubert_base_ls960.pt
+    ckpt_path = "assets/hubert/hubert_base_ls960.pt"
+
+    # Load model, configuration, and task
+    models, cfg, task = load_model_ensemble_and_task([ckpt_path])
+
+    # Use the first model in the ensemble
+    phoneme_recognizer = models[0]
+
+    # Ensure the model is in evaluation mode
+    phoneme_recognizer.eval()
+
     cache = []
     for epoch in range(epoch_str, hps.train.epochs + 1):
         if rank == 0:
@@ -277,6 +301,7 @@ def run(rank, n_gpus, hps, logger: logging.Logger):
                 logger,
                 [writer, writer_eval],
                 cache,
+                phoneme_recognizer,  # Pass the phoneme recognizer
             )
         else:
             train_and_evaluate(
@@ -291,13 +316,14 @@ def run(rank, n_gpus, hps, logger: logging.Logger):
                 None,
                 None,
                 cache,
+                phoneme_recognizer,  # Pass the phoneme recognizer
             )
         scheduler_g.step()
         scheduler_d.step()
 
 
 def train_and_evaluate(
-    rank, epoch, hps, nets, optims, schedulers, scaler, loaders, logger, writers, cache
+    rank, epoch, hps, nets, optims, schedulers, scaler, loaders, logger, writers, cache, phoneme_recognizer
 ):
     net_g, net_d = nets
     optim_g, optim_d = optims
@@ -310,6 +336,15 @@ def train_and_evaluate(
 
     net_g.train()
     net_d.train()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # If using mixed-precision, convert the model weights to float16
+    if hps.train.fp16_run:  # Check if mixed-precision is enabled
+        phoneme_recognizer = phoneme_recognizer.half()
+    phoneme_recognizer.to(device)
+
+    # Initialize the encoder inside the function to ensure it's in the correct process
+    encoder = VoiceEncoder()  # Defaults to CPU
 
     # Prepare data iterator
     if hps.if_cache_data_in_gpu == True:
@@ -491,7 +526,83 @@ def train_and_evaluate(
                 loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl
                 loss_fm = feature_loss(fmap_r, fmap_g)
                 loss_gen, losses_gen = generator_loss(y_d_hat_g)
-                loss_gen_all = loss_gen + loss_fm + loss_mel + loss_kl
+
+                # Additional Losses
+                with torch.no_grad():
+                    # Move tensors to CPU and convert to NumPy
+                    wave_np = wave.cpu().numpy()  # Shape: [batch_size, channels, length]
+                    y_hat_np = y_hat.cpu().numpy()  # Shape: [batch_size, channels, length]
+
+                    # Initialize lists to store embeddings
+                    real_embeddings = []
+                    generated_embeddings = []
+
+                    # Iterate over each sample in the batch
+                    for i in range(wave_np.shape[0]):
+                        # Extract the i-th sample and remove the channel dimension
+                        wave_sample = wave_np[i, 0, :]  # Shape: [length]
+                        y_hat_sample = y_hat_np[i, 0, :]  # Shape: [length]
+
+                        # Ensure the audio is a 1D NumPy array
+                        if wave_sample.ndim != 1:
+                            logger.warning(f"Wave sample {i} is not 1D. Reshaping.")
+                            wave_sample = np.squeeze(wave_sample)
+                        if y_hat_sample.ndim != 1:
+                            logger.warning(f"Y_hat sample {i} is not 1D. Reshaping.")
+                            y_hat_sample = np.squeeze(y_hat_sample)
+
+                        # Normalize the audio if not already
+                        if np.max(np.abs(wave_sample)) > 1.0:
+                            wave_sample = wave_sample / np.max(np.abs(wave_sample))
+                        if np.max(np.abs(y_hat_sample)) > 1.0:
+                            y_hat_sample = y_hat_sample / np.max(np.abs(y_hat_sample))
+
+                        # Extract embeddings
+                        real_emb = encoder.embed_utterance(wave_sample)
+                        gen_emb = encoder.embed_utterance(y_hat_sample)
+
+                        real_embeddings.append(real_emb)
+                        generated_embeddings.append(gen_emb)
+
+                    # Convert lists to NumPy arrays
+                    real_speaker_embeddings_np = np.stack(real_embeddings)  # Shape: [batch_size, embedding_dim]
+                    generated_speaker_embeddings_np = np.stack(generated_embeddings)  # Shape: [batch_size, embedding_dim]
+
+                    #logger.info(f"Real Speaker Embeddings Shape: {real_speaker_embeddings_np.shape}")
+                    #logger.info(f"Generated Speaker Embeddings Shape: {generated_speaker_embeddings_np.shape}")
+                                    
+                    #print("Original wave shape:", wave.shape)
+                    # Remove unnecessary dimensions
+                    if wave.ndim == 3:
+                        wave = wave.squeeze(1)  # Remove the second dimension
+                    #print("Adjusted wave shape:", wave.shape)
+
+                    # Ensure wave and y_hat are in the correct precision
+                    wave = wave.to(dtype=torch.float32 if not hps.train.fp16_run else torch.float16)
+                    y_hat = y_hat.to(dtype=torch.float32 if not hps.train.fp16_run else torch.float16)
+
+                    # Extract real phoneme features using HuBERT
+                    real_phoneme_features, _ = phoneme_recognizer.extract_features(wave, output_layer=9)  # Choose an intermediate layer (e.g., layer 9)
+
+                    # Extract generated phoneme features using HuBERT
+                    generated_phoneme_features, _ = phoneme_recognizer.extract_features(y_hat.detach().squeeze(1), output_layer=9)
+
+                real_speaker_embeddings = torch.from_numpy(real_speaker_embeddings_np).to(device).type(torch.float32)
+                generated_speaker_embeddings = torch.from_numpy(generated_speaker_embeddings_np).to(device).type(torch.float32)
+
+                real_speaker_embeddings = normalize_embeddings(real_speaker_embeddings)
+                generated_speaker_embeddings = normalize_embeddings(generated_speaker_embeddings)
+
+                # Compute speaker embedding loss
+                loss_speaker = speaker_embedding_loss(generated_speaker_embeddings, real_speaker_embeddings) * hps.train.c_speaker
+                
+
+                # Compute phoneme consistency loss
+                loss_phoneme = phoneme_consistency_loss(real_phoneme_features, generated_phoneme_features) * hps.train.c_phoneme
+                
+                # Total Generator Loss
+                loss_gen_all = loss_gen + loss_fm + loss_mel + loss_kl + loss_speaker + loss_phoneme
+
         optim_g.zero_grad()
         scaler.scale(loss_gen_all).backward()
         scaler.unscale_(optim_g)
@@ -636,5 +747,5 @@ def train_and_evaluate(
 
 
 if __name__ == "__main__":
-    torch.multiprocessing.set_start_method("spawn")
+    torch.multiprocessing.set_start_method("spawn", force=True)
     main()
