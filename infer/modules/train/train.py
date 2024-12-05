@@ -152,8 +152,8 @@ def run(rank, n_gpus, hps, logger: logging.Logger):
     train_sampler = DistributedBucketSampler(
         train_dataset,
         hps.train.batch_size * n_gpus,
-        # [100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1200,1400],  # 16s
-        [100, 200, 300, 400, 500, 600, 700, 800, 900],  # 16s
+        [100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1200,1400],  # 16s <-- tries as there might be longer training data
+        #[100, 200, 300, 400, 500, 600, 700, 800, 900],  # 16s <-- original
         num_replicas=n_gpus,
         rank=rank,
         shuffle=True,
@@ -199,12 +199,14 @@ def run(rank, n_gpus, hps, logger: logging.Logger):
         hps.train.learning_rate,
         betas=hps.train.betas,
         eps=hps.train.eps,
+        weight_decay=hps.train.weight_decay,  # Ensure this parameter is defined
     )
     optim_d = torch.optim.AdamW(
         net_d.parameters(),
         hps.train.learning_rate,
         betas=hps.train.betas,
         eps=hps.train.eps,
+        weight_decay=hps.train.weight_decay,  # Ensure this parameter is defined
     )
     # net_g = DDP(net_g, device_ids=[rank], find_unused_parameters=True)
     # net_d = DDP(net_d, device_ids=[rank], find_unused_parameters=True)
@@ -283,8 +285,18 @@ def run(rank, n_gpus, hps, logger: logging.Logger):
     # Use the first model in the ensemble
     phoneme_recognizer = models[0]
 
-    # Ensure the model is in evaluation mode
+    # Ensure the model is in evaluation mode, to prevent training its parameters.
     phoneme_recognizer.eval()
+
+    # If using mixed-precision, convert the model weights to float16
+    if hps.train.fp16_run:  # Check if mixed-precision is enabled
+        phoneme_recognizer = phoneme_recognizer.half()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    phoneme_recognizer.to(device)
+
+    # Initializes a VoiceEncoder instance for speaker embedding extraction.
+    encoder = VoiceEncoder()  # Defaults to CPU
 
     cache = []
     for epoch in range(epoch_str, hps.train.epochs + 1):
@@ -302,6 +314,8 @@ def run(rank, n_gpus, hps, logger: logging.Logger):
                 [writer, writer_eval],
                 cache,
                 phoneme_recognizer,  # Pass the phoneme recognizer
+                device,
+                encoder,
             )
         else:
             train_and_evaluate(
@@ -317,13 +331,15 @@ def run(rank, n_gpus, hps, logger: logging.Logger):
                 None,
                 cache,
                 phoneme_recognizer,  # Pass the phoneme recognizer
+                device,
+                encoder,
             )
         scheduler_g.step()
         scheduler_d.step()
 
 
 def train_and_evaluate(
-    rank, epoch, hps, nets, optims, schedulers, scaler, loaders, logger, writers, cache, phoneme_recognizer
+    rank, epoch, hps, nets, optims, schedulers, scaler, loaders, logger, writers, cache, phoneme_recognizer, device, encoder
 ):
     net_g, net_d = nets
     optim_g, optim_d = optims
@@ -336,15 +352,6 @@ def train_and_evaluate(
 
     net_g.train()
     net_d.train()
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # If using mixed-precision, convert the model weights to float16
-    if hps.train.fp16_run:  # Check if mixed-precision is enabled
-        phoneme_recognizer = phoneme_recognizer.half()
-    phoneme_recognizer.to(device)
-
-    # Initialize the encoder inside the function to ensure it's in the correct process
-    encoder = VoiceEncoder()  # Defaults to CPU
 
     # Prepare data iterator
     if hps.if_cache_data_in_gpu == True:
@@ -490,6 +497,7 @@ def train_and_evaluate(
                 mel, ids_slice, hps.train.segment_size // hps.data.hop_length
             )
             with autocast(enabled=False):
+                # Slices the mel spectrogram and generated audio (y_hat_mel) into segments.
                 y_hat_mel = mel_spectrogram_torch(
                     y_hat.float().squeeze(1),
                     hps.data.filter_length,
@@ -596,10 +604,17 @@ def train_and_evaluate(
                 # Compute speaker embedding loss
                 loss_speaker = speaker_embedding_loss(generated_speaker_embeddings, real_speaker_embeddings) * hps.train.c_speaker
                 
-
                 # Compute phoneme consistency loss
                 loss_phoneme = phoneme_consistency_loss(real_phoneme_features, generated_phoneme_features) * hps.train.c_phoneme
                 
+                # # print 
+                # print("loss_gen:", loss_gen)
+                # print("loss_fm:", loss_fm)
+                # print("loss_mel:", loss_mel)
+                # print("loss_kl:", loss_kl)
+                # print("loss_speaker:", loss_speaker)
+                # print("loss_phoneme:", loss_phoneme)
+
                 # Total Generator Loss
                 loss_gen_all = loss_gen + loss_fm + loss_mel + loss_kl + loss_speaker + loss_phoneme
 

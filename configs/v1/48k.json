@@ -6,7 +6,7 @@
     "learning_rate": 1e-4,
     "betas": [0.8, 0.99],
     "eps": 1e-9,
-    "batch_size": 4,
+    "batch_size": 12,
     "fp16_run": true,
     "lr_decay": 0.999875,
     "segment_size": 11520,
@@ -14,8 +14,9 @@
     "warmup_epochs": 0,
     "c_mel": 45,
     "c_kl": 1.0,
-    "c_speaker": 1.0,
-    "c_phoneme": 1.0
+    "c_speaker": 200,
+    "c_phoneme": 120,
+    "weight_decay": 1e-05
   },
   "data": {
     "max_wav_value": 32768.0,
