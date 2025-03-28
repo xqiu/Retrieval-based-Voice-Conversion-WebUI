@@ -287,7 +287,9 @@ def infer_ui(source: str, output: str, model: str, index: str, rate: float, auto
         "--splice_size_mb", str(slice_size),
         "--log_file", log_file
     ]
-    if index:
+    #check if index file existed
+    has_index = index and os.path.exists(index)
+    if has_index:
         process_command.extend(["--index_path", index])
     try:
         result = subprocess.run(process_command, capture_output=True, text=True, cwd=RVC_PATH, encoding="utf-8")
@@ -339,7 +341,8 @@ with gr.Blocks() as webapp:
         index = gr.Textbox(label=_("Index"), interactive=True, value=preferences.get_index())
         browse_button = gr.Button(value=_("Browse"))
         browse_button.click(
-            fn=lambda: open_select_file_dialog("index", RVC_PATH),
+            #default folder is RVC_PATH/assets/weights
+            fn=lambda: open_select_file_dialog("index", os.path.join(RVC_PATH, "assets", "weights")),
             inputs=[],
             outputs=index
         )

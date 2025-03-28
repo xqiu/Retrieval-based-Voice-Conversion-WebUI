@@ -64,7 +64,10 @@ def append_silence(input_file: str, append_duration: float, sample_rate: int, ch
     """
     log_message(f'append silence to {input_file} by {append_duration} seconds')
     # output file name = input file name appended with '_append'
-    output_file = input_file.replace('.wav', '_append.wav')
+    output_file = input_file
+    if '.wav' in input_file:
+        output_file = input_file.rsplit('.wav', 1)[0] + '_append.wav'
+        
     #if output_file already exists, skip it
     if continue_job and os.path.exists(output_file):
         print(f"[WARNING] Skipping appending silence to {input_file} because {output_file} already exists")

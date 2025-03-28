@@ -105,7 +105,7 @@ def get_silient_times(input_file: str, noise_threshold: int, silence_duration: f
     log_message(f"Detecting silence in {input_file} with noise threshold {noise_threshold} dB and silence duration {silence_duration} seconds", log_file=log_file)
     try:
         result = subprocess.run(silence_cmd, stderr=subprocess.PIPE, text=True, check=True, encoding='utf-8')
-    except subprocess.CalledProcessError as e:
+    except Exception as e:
         log_message(f"{SPLIT_FAILED} detecting silence: {e}", level="ERROR", log_file=log_file)
         return None
 
@@ -139,7 +139,9 @@ def append_silence(input_file: str, append_duration: float, sample_rate: int, ch
         str: output file path (if fail will return same path as input_file)
     """
     # output file name = input file name appended with '_append'
-    output_file = input_file.replace('.wav', '_append.wav')
+    output_file = input_file
+    if input_file.endswith('.wav'):
+        output_file = input_file.rsplit('.wav', 1)[0] + '_append.wav'
     #if output_file already exists, skip it
     if continue_job and os.path.exists(output_file):
         log_message(f"Skipping appending silence to {input_file} because {output_file} already exists", log_file=log_file, level='WARNING')
@@ -151,7 +153,7 @@ def append_silence(input_file: str, append_duration: float, sample_rate: int, ch
     ]
     try: 
         subprocess.run(ffmpeg_silence_cmd, check=True, encoding='utf-8')
-    except subprocess.CalledProcessError as e:
+    except Exception as e:
         log_message(f"appending silence: {e}", level="ERROR", log_file=log_file)
         return input_file
 
@@ -245,7 +247,7 @@ def split_audio_into_segments(input_file: str, output_dir: str, min_duration: in
         ]
         try:
             subprocess.run(ffmpeg_extract_cmd, check=True, encoding='utf-8')
-        except subprocess.CalledProcessError as e:
+        except Exception as e:
             #since we cannot process every segment, give up this job
             log_message(f"{SPLIT_FAILED} extracting segment: {e}", level="ERROR", log_file=log_file)
             return []
@@ -271,7 +273,7 @@ def sub_concat_audio(sub_segment_list, output_filepath):
     log_message(f"Running batch concat command: {cmd}", log_file=log_file)
     try:
         subprocess.run(cmd, check=True, encoding='utf-8')
-    except subprocess.CalledProcessError as e:
+    except Exception as e:
         log_message(f"{CONCAT_FAILED}: {e}", level="ERROR", log_file=log_file)
         return False
     return True
@@ -299,7 +301,7 @@ def concat_audio_files(segment_pair_list, output_path: str, temp_dir: str,batch_
     import math
     concat_list_path = os.path.join(temp_dir, f'concat.txt')
     segments = []
-    with open(concat_list_path, 'w') as f:
+    with open(concat_list_path, 'w', encoding='utf-8') as f:
         for input_file, _ in segment_pair_list:
             segments.append(input_file)
             f.write(f"file '{input_file}'\n")
@@ -345,7 +347,7 @@ def process_audio(source_path: str, output_path: str, model: str, index_path: st
     p_out = None
     try:
         p_out = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8')
-    except subprocess.CalledProcessError as e:
+    except Exception as e:
         log_message(f"{PROCESS_FAILED}: {e}", level="ERROR", log_file=log_file)
         return False
     
@@ -477,8 +479,11 @@ if __name__ == "__main__":
     #detect if ffmpeg is installed
     try:
         subprocess.run(['ffmpeg', '-version'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, encoding='utf-8')
-    except subprocess.CalledProcessError:
-        raise "FFmpeg is not installed. Please install FFmpeg first."
+    except:
+        sys.stdout.buffer.writelines([
+            "FFmpeg is not installed. Please install FFmpeg first.".encode('utf-8')
+        ])
+        sys.exit(1)
     
     parser = argparse.ArgumentParser(description='Process audio files in batch with splitting.')
     parser.add_argument('--input_dir', required=True, help="Input directory")
