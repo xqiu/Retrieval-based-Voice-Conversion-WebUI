@@ -5,7 +5,24 @@ import os
 import subprocess
 import json
 import datetime
-from run_infer import log_message, RVC_PATH, VENV_PATH
+
+RVC_PATH = os.path.dirname(os.path.realpath(__file__))
+VENV_PATH = os.path.join(RVC_PATH, ".venv", "python.exe")
+if not os.path.exists(VENV_PATH):
+    VENV_PATH = os.path.join(RVC_PATH, "venv", "Scripts", "python.exe")
+if not os.path.exists(VENV_PATH):
+    raise FileNotFoundError(f"Virtual environment python executable not found at {VENV_PATH}. Please create a virtual environment first.")
+
+LOG_FILE = os.path.join(RVC_PATH, "run_infer.log")
+log_file = None
+
+def log_message(message, level="INFO"):
+    global log_file
+    if log_file is None:
+        log_file = LOG_FILE
+        print(f"[WARNING] using default log file: {log_file}")
+    with open(log_file, "a", encoding='utf-8') as log_fd:
+        log_fd.write(f"[{level}] {message}\n")
 
 #BEGIN argparse
 parser = argparse.ArgumentParser(description='Puti Infer Web')
@@ -19,17 +36,6 @@ args = parser.parse_args()
 # Constants
 MODEL_DIR = os.path.join(RVC_PATH, "assets", "weights")
 PREF_FILE = os.path.join(RVC_PATH, "run_infer_preferences.json")
-RATE_MIN = 0.6
-RATE_MAX = 0.75
-RATE_STEP = 0.05
-DEFAULT_RATE = 0.75
-
-#slice size in mega bytes
-SLICE_SIZE_MAX = 100
-SLICE_SIZE_MIN = 0
-SLICE_SIZE_STEP = 5
-DEFAULT_SLICE_SIZE = 40
-DEFAULT_SLICE_ENABLE = True
 
 #generate log file path base on today date
 log_file = os.path.join(RVC_PATH, "infer_logs", f"{datetime.datetime.now().strftime('%Y-%m-%d')}.log")
@@ -45,7 +51,6 @@ EN_US_JSON = {
   "Output": "Output Folder",
   "Model": "AI Model File",
   "Index": "Index File (Optional)",
-  "Rate": "Index Rate",
   "Run": "Run",
   "Browse": "Browse",
   "Refresh": "Refresh",
@@ -57,8 +62,6 @@ EN_US_JSON = {
   "Cancel": "Cancel",
   "Message Box": "Message Box",
   "Path Dialog": "Path Dialog",
-  "Auto Slice File": "Auto Slice File",
-  "Auto Slice Size": "Auto Slice Size",
   "OutOfMemoryError": "CUDA out of memory, file too big",
   "Please select folder": "Please Select Folder",
   "Select a File": "Select a File",
@@ -85,7 +88,6 @@ ZH_TW_JSON = {
   "Output": "輸出目錄",
   "Model": "AI 模型",
   "Index": "Index 檔 (選填)",
-  "Rate": "Index Rate",
   "Run": "執行",
   "Browse": "瀏覽",
   "Refresh": "更新",
@@ -97,8 +99,6 @@ ZH_TW_JSON = {
   "Cancel": "取消",
   "Message Box": "訊息",
   "Path Dialog": "選擇路徑",
-  "Auto Slice File": "自動切割檔案",
-  "Auto Slice Size": "自動切割大小",
   "OutOfMemoryError": "CUDA 記憶體不足，檔案太大",
   "Please select folder": "請選擇資料夾",
   "Select a File": "選擇檔案",
@@ -167,9 +167,6 @@ class Preference:
             "output": "",
             "model": get_model_list()[0],
             "index": "",
-            "rate": DEFAULT_RATE,
-            "auto_slice": DEFAULT_SLICE_ENABLE,
-            "slice_size": DEFAULT_SLICE_SIZE
         }
         self.load_preferences()
 
@@ -178,7 +175,7 @@ class Preference:
             with open(PREF_FILE, "w") as f:
                 json.dump(self.data, f)
         except Exception as e:
-            log_message(f"Error saving preferences: {str(e)}", level="ERROR", log_file=log_file)
+            log_message(f"Error saving preferences: {str(e)}", level="ERROR")
 
     def load_preferences(self):
         if os.path.exists(PREF_FILE):
@@ -186,7 +183,7 @@ class Preference:
                 with open(PREF_FILE, "r") as f:
                     self.data.update(json.load(f))
             except Exception as e:
-                log_message(f"Error loading preferences: {str(e)}", level="ERROR", log_file=log_file)
+                log_message(f"Error loading preferences: {str(e)}", level="ERROR")
 
     def get_preference(self, key):
         return self.data.get(key)
@@ -214,20 +211,6 @@ class Preference:
     def update_index(self, value):
         self.update_preference("index", value)
 
-    def get_rate(self):
-        return self.get_preference("rate")
-    def update_rate(self, value):
-        self.update_preference("rate", value)
-
-    def get_auto_slice(self):
-        return self.get_preference("auto_slice")
-    def update_auto_slice(self, value):
-        self.update_preference("auto_slice", value)
-
-    def get_slice_size(self):
-        return self.get_preference("slice_size")
-    def update_slice_size(self, value):
-        self.update_preference("slice_size", value)
 # END preference
 
 # Helper functions
@@ -273,32 +256,33 @@ def update_success_status(success):
     print(f'try update success as {success}, {not success}')
     return gr.update(visible=success), gr.update(visible=not success)
 
-def infer_ui(source: str, output: str, model: str, index: str, rate: float, auto_slice: bool, slice_size: int):
-    #if not set auto_slice, set slice_size to very large number to disable slicing
-    if not auto_slice:
-        slice_size = 99999999
-
+def infer_ui(source: str, output: str, model: str, index: str):
+    global log_file
     process_command = [
         VENV_PATH, os.path.join(RVC_PATH, "run_infer.py"),
         "--input_dir", source,
         "--output_dir", output,
         "--model", model,
-        "--index_rate", str(rate),
-        "--splice_size_mb", str(slice_size),
-        "--log_file", log_file
+        "--log_file", log_file,
     ]
     if index:
         process_command.extend(["--index_path", index])
     try:
+        print(f"Running command: {' '.join(process_command)}")
+        log_message(f"Running command: {' '.join(process_command)}", level="INFO")
+
         result = subprocess.run(process_command, capture_output=True, text=True, cwd=RVC_PATH, encoding="utf-8")
         if result.returncode != 0:
-            log_message(result.stdout + '\n' + result.stderr, level="ERROR", log_file=log_file)
+            log_message(result.stdout + '\n' + result.stderr, level="ERROR")
+            print(f"Command failed with error: {result.stderr}")
             return False, result.stdout
         else:
-            log_message(result.stdout, level="INFO", log_file=log_file)
+            log_message(result.stdout, level="INFO")
+            print(f"Command executed successfully: {result.stdout}")
             return True, result.stdout
     except Exception as e:
-        log_message(str(e), level="ERROR", log_file=log_file)
+        log_message(str(e), level="ERROR")
+        print(f"Error running command: {str(e)}")
         return False, str(e)
 
 # Initialize preferences
@@ -344,14 +328,6 @@ with gr.Blocks() as webapp:
             outputs=index
         )
         index.change(preferences.update_index, inputs=[index], outputs=[])
-        rate = gr.Slider(RATE_MIN, RATE_MAX, value=preferences.get_rate(), step=RATE_STEP, label=_("Index Rate"))
-        rate.change(preferences.update_rate, inputs=[rate], outputs=[])
-    with gr.Row():
-        auto_slice = gr.Checkbox(label=_("Auto Slice File"), value=preferences.get_auto_slice())
-        auto_slice.change(preferences.update_auto_slice, inputs=[auto_slice], outputs=[])
-        with gr.Row():
-            slice_size = gr.Slider(label=_("Auto Slice Size") + " (MB)", value=preferences.get_slice_size(), maximum=SLICE_SIZE_MAX, minimum=SLICE_SIZE_MIN, step=SLICE_SIZE_STEP)
-            slice_size.change(preferences.update_slice_size, inputs=[slice_size], outputs=[])
     with gr.Row():
         run_button = gr.Button(_("Run"))
     #show result
@@ -371,7 +347,7 @@ with gr.Blocks() as webapp:
     
     run_button.click(
         fn=infer_ui,
-        inputs=[source, output, model, index, rate, auto_slice, slice_size],
+        inputs=[source, output, model, index],
         outputs=[is_success, result],
     )
 print(currentI18n["ProgramRunningPleaseDontClose"])

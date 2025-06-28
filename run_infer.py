@@ -1,361 +1,345 @@
-import datetime
 import os
 import subprocess
 import argparse
 import sys
 import shutil
 import re
+import datetime
+import math
+import shlex
+from pydub import AudioSegment
 
 RVC_PATH = os.path.dirname(os.path.realpath(__file__))
-VENV_PATH = os.path.join(RVC_PATH, ".venv", "python.exe")
 LOG_FILE = os.path.join(RVC_PATH, "run_infer.log")
 log_file = None
 
-SPLIT_FAILED = "SPLIT_FAILED"
-PROCESS_FAILED = "PROCESS_FAILED"
-CONCAT_FAILED = "CONCAT_FAILED"
+# (Optional) Duration constraints—you may use them later if needed.
+MIN_SEGMENT_DURATION = 120  # 2 minutes
+MAX_SEGMENT_DURATION = 180  # 3 minutes
 
-def log_message(message, level="INFO", log_file=LOG_FILE):
-    if log_file is LOG_FILE:
-        print(f"[WARNING] using default log file")
-    with open(log_file, "a", encoding='utf-8') as log_file:
-        log_file.write(f"[{level}] {message}\n")
-
-# 5 minutes in seconds
-DEFAULT_MIN_SEGMENT_DURATION = 300
-# 10 minutes in seconds
-DEFAULT_MAX_SEGMENT_DURATION = 600
-# Noise threshold in dB
-DEFAULT_NOISE_THRESHOLD = -50
-# Minimum silence duration in seconds
-DEFAULT_SILENCE_DURATION = 0.5  
-
-SUPPORTED_EXTENSION_LIST = ('.wav', '.mp3')
-
-def get_silient_times(input_file, noise_threshold, silence_duration):
+def log_message(message, level="INFO"):
     global log_file
+    if log_file is None:
+        log_file = LOG_FILE
+        print(f"[WARNING] using default log file: {log_file}")
+    with open(log_file, "a", encoding='utf-8') as log_fd:
+        log_fd.write(f"[{level}] {message}\n")
 
+def get_audio_detail(input_file):
+    """_summary_
+
+    Args:
+        input_file (_str_): path of audio file (wav or mp3)
+
+    Returns:
+        tuple: (duration: float, sample_rate: int, channel_str: str)
+        duration: unit second
+        sample_rate: unit Hz
+        channel_str: mono, stereo, 5.1, 7.1, unknown
+    """
+    #using ffprobe to get the duration of the audio file
+    detail_cmd = [
+        'ffprobe', '-v', 'error', '-show_entries', 
+        # ffprobe use it's own order. even you write duration,sample_rate,channels, it still return data in the order of sample_rate, channels, duration
+        'stream=sample_rate,channels,duration',
+        '-of', 'default=noprint_wrappers=1:nokey=1', input_file
+    ]
+    try:
+        output = subprocess.run(detail_cmd, stdout=subprocess.PIPE, text=True, check=True, encoding='utf-8').stdout.strip()
+        sample_rate, channel, duration = output.split('\n')
+
+        #set channel str
+        # mono if 1
+        # stereo if 2
+        # 5.1 if 6
+        # 7.1 if 8
+        channel_str = 'mono' if channel == '1' else 'stereo' if channel == '2' else '5.1' if channel == '6' else '7.1' if channel == '8' else 'unknown'
+
+        log_message(f"get_audio_detail {input_file} => \n\tduration: {duration}, \n\tsample_rate: {sample_rate}, \n\tchannel: {channel}")
+
+        return float(duration), int(sample_rate), channel_str
+    except (subprocess.CalledProcessError, ValueError) as e:
+        return -1.0, -1, 'unknown'
+
+def append_silence(input_file: str, append_duration: float, sample_rate: int, channel: str, continue_job) -> bool:
+    """
+    Append silence to the end of the input audio file.
+
+    Args:
+        input_file (str): input audio file path
+        append_duration (float): duration of silence to append in seconds
+        sample_rate (int): sample rate of the audio file
+        channel (str): channel of the audio file
+    Returns:
+        str: output file path (if fail will return same path as input_file)
+    """
+    log_message(f'append silence to {input_file} by {append_duration} seconds')
+    # output file name = input file name appended with '_append'
+    output_file = input_file
+    if '.wav' in input_file:
+        output_file = input_file.rsplit('.wav', 1)[0] + '_append.wav'
+        
+    #if output_file already exists, skip it
+    if continue_job and os.path.exists(output_file):
+        print(f"[WARNING] Skipping appending silence to {input_file} because {output_file} already exists")
+        return output_file
+    
+    ffmpeg_silence_cmd = [
+        'ffmpeg', '-y', '-i', input_file, '-f', 'lavfi', '-t', str(append_duration), '-i', f'anullsrc=channel_layout={channel}:sample_rate={sample_rate}', '-filter_complex', '[0][1]concat=n=2:v=0:a=1', output_file
+    ]
+    try: 
+        subprocess.run(ffmpeg_silence_cmd, check=True, encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except subprocess.CalledProcessError as e:
+        log_message(f"[Error] appending silence: {e}")
+        return input_file
+
+    return output_file
+
+def split_audio_into_segments(input_file, temp_dir, noise_threshold=-30, silence_duration=1, continue_job=False):
+    """
+    Splits the input audio file into segments labeled as 'silence' and 'non_silence'
+    using ffmpeg's silencedetect filter.
+    
+    Returns a list of tuples: (segment_file, segment_type, start_time, end_time)
+    """
+    # Run ffmpeg silencedetect to get silence intervals.
     silence_cmd = [
         'ffmpeg', '-i', input_file, '-af',
         f'silencedetect=noise={noise_threshold}dB:d={silence_duration}', '-f', 'null', '-'
     ]
-    try:
-        result = subprocess.run(silence_cmd, stderr=subprocess.PIPE, text=True, check=True, encoding='utf-8')
-    except subprocess.CalledProcessError as e:
-        log_message(f"{SPLIT_FAILED} detecting silence: {e}", level="ERROR", log_file=log_file)
-        return False
 
-    # Parse the output to find silence timestamps
-    silence_times = []
-    for line in result.stderr.split('\n'):
-        if 'silence_end' in line:
+    result = subprocess.run(silence_cmd, stderr=subprocess.PIPE, text=True, check=True, encoding='utf-8')
+    
+    # Parse the stderr output to get pairs of silence_start and silence_end.
+    silence_intervals = []
+    current_silence_start = None
+    for line in result.stderr.splitlines():
+        if 'silence_start' in line:
+            match = re.search(r'silence_start: (\d+\.?\d*)', line)
+            if match:
+                current_silence_start = float(match.group(1))
+        if 'silence_end' in line and current_silence_start is not None:
             match = re.search(r'silence_end: (\d+\.?\d*)', line)
             if match:
-                silence_times.append(float(match.group(1)))
-    return silence_times
+                silence_end = float(match.group(1))
+                silence_intervals.append((current_silence_start, silence_end))
+                current_silence_start = None
 
-def split_audio_on_silence(input_file, output_dir, min_duration=DEFAULT_MIN_SEGMENT_DURATION, max_duration=DEFAULT_MAX_SEGMENT_DURATION, noise_threshold=DEFAULT_NOISE_THRESHOLD, silence_duration=DEFAULT_SILENCE_DURATION, enable = True):
-    """
-    Split an audio file into segments based on silence, with min and max duration constraints.
-
-    Parameters:
-    - input_file (str): Path to the input audio file (e.g., 'input.wav').
-    - output_dir (str): Directory to save the split audio files.
-    - min_duration (int): Minimum segment duration in seconds (default: 300 = 5 minutes).
-    - max_duration (int): Maximum segment duration in seconds (default: 600 = 10 minutes).
-    - noise_threshold (int): Noise threshold in dB for silence detection (default: -30).
-    - silence_duration (float): Minimum silence duration in seconds (default: 0.5).
-    - enable (bool): Enable or disable the splitting process (default: True).
-
-    Returns:
-    - bool: True if splitting was successful, False otherwise.
-    """
-    global log_file
-    # Ensure the output directory exists
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Step 1: Detect silence timestamps
-    silence_times = get_silient_times(input_file, noise_threshold, silence_duration) if enable else []
-    #BEGIN NO SILENCE DETECTED
-    if not silence_times:
-        if enable:
-            log_message("No silence detected. Adjust noise threshold or silence duration.", log_file=log_file)
-        # Fallback: Copy the entire file as a single segment
-        output_file = os.path.join(output_dir, '000.wav')
-        ffmpeg_copy_cmd = [
-            'ffmpeg', '-i', input_file, '-c:a', 'pcm_s16le', output_file
-        ]
-        try:
-            subprocess.run(ffmpeg_copy_cmd, check=True, encoding='utf-8')
-            log_message(f"No splits applied. Copied entire file to {output_file}", log_file=log_file)
-            return True
-        except subprocess.CalledProcessError as e:
-            log_message(f"copying file: {e}", level="ERROR", log_file=log_file)
-            return False
-    #END NO SILENCE DETECTED
-    # Step 2: Filter timestamps to enforce min/max duration
-    filtered_split_times = []
-    last_split_time = 0  # Start of the first segment
-
-    for silence_time in silence_times:
-        segment_duration = silence_time - last_split_time
-
-        # If the segment would be shorter than the minimum duration, skip this split point
-        if segment_duration < min_duration:
-            continue
-
-        # If the segment would be longer than the maximum duration, force a split at max_duration
-        while segment_duration > max_duration:
-            last_split_time += max_duration
-            filtered_split_times.append(last_split_time)
-            segment_duration = silence_time - last_split_time
-
-        # Now the segment is within bounds (or close), so add the silence point as a split
-        filtered_split_times.append(silence_time)
-        last_split_time = silence_time
-
-    # Step 3: Handle the last segment (if any audio remains)
-    # Get the total duration of the audio
+    # Get total duration of the input file.
     duration_cmd = [
         'ffprobe', '-v', 'error', '-show_entries', 'format=duration',
         '-of', 'default=noprint_wrappers=1:nokey=1', input_file
     ]
-    try:
-        total_duration = float(subprocess.run(duration_cmd, stdout=subprocess.PIPE, text=True, check=True, encoding='utf-8').stdout.strip())
-    except (subprocess.CalledProcessError, ValueError) as e:
-        log_message(f"{SPLIT_FAILED} getting audio duration: {e}", level="ERROR", log_file=log_file)
-        return False
+    total_duration = float(subprocess.run(duration_cmd, stdout=subprocess.PIPE, text=True, check=True).stdout.strip())
+    log_message(f'BEGIN file => {input_file}')
+    log_message(f'\t=> total_duration: {total_duration}')
+    # Create segments: non-silence segments are between silence intervals.
+    segments = []  # Each element is (start_time, end_time, segment_type)
+    current_time = 0.0
+    log_message(f'BEGIN RAW silence_intervals')
+    for (silence_start, silence_end) in silence_intervals:
+        log_message(f'{silence_start}\t{silence_end}')
+        adjust_silence_start = silence_start
+        adjust_silence_end = silence_end
+        #adjust silence_start and silence_end
+        # 1. precision only to 1 decimal place
+        # 2. adjust_silence_start will be greater or equal to silence_start
+        # 3. adjust_silence_end will be less or equal to silence_end
+        # adjust_silence_start = round(silence_start, 1)
+        # adjust_silence_end = round(silence_end, 1)
+        # if adjust_silence_start < silence_start:
+        #     adjust_silence_start += 0.1
+        # if adjust_silence_end > silence_end:
+        #     adjust_silence_end -= 0.1
+        # If there is audio before this silence, add it as a non-silence segment.
+        if adjust_silence_start > current_time:
+            segments.append((current_time, adjust_silence_start, 'non_silence'))
+        # Add the silence segment.
+        segments.append((adjust_silence_start, adjust_silence_end, 'silence'))
+        current_time = adjust_silence_end
+    log_message(f'END RAW silence_intervals')
+    # If there is audio after the last silence, add it.
+    if current_time < total_duration:
+        segments.append((current_time, total_duration, 'non_silence'))
 
-    # Check if there's remaining audio after the last split
-    remaining_duration = total_duration - last_split_time
-    while remaining_duration > 0:
-        if remaining_duration > max_duration:
-            # If the remaining audio is longer than the max duration, split at max_duration
-            last_split_time += max_duration
-            filtered_split_times.append(last_split_time)
-            remaining_duration = total_duration - last_split_time
-        elif remaining_duration < min_duration and len(filtered_split_times) > 0:
-            # If the remaining audio is shorter than the min duration, merge it with the previous segment
-            filtered_split_times.pop()  # Remove the last split point
-            break
-        else:
-            # The remaining audio is within bounds, so no further splits are needed
-            break
+    # Extract each segment to its own file.
+    extracted_segments = []
+    log_message(f'BEGIN segments')
+    for idx, (start, end, seg_type) in enumerate(segments):
+        log_message(f'{start}\t{end}\t{seg_type}')
+        duration = end - start
+        if(duration < 0.05):
+            print(f"[WARNING] Skipping short segment of file {input_file}:\n\t {start}-{end} ({duration}s)")
+            log_message(f"[WARNING] Skipping short segment of file {input_file}:\n\t {start}-{end} ({duration}s)")
+            continue
+        segment_filename = os.path.join(temp_dir, f"{idx:04d}_{seg_type}_{start}_{end}.wav")
 
-    # Step 4: Split the audio at the filtered timestamps
-    if filtered_split_times:
-        ffmpeg_split_cmd = [
-            'ffmpeg', '-i', input_file, '-f', 'segment',
-            '-segment_times', ','.join(map(str, filtered_split_times)),
-            '-c:a', 'pcm_s16le', os.path.join(output_dir, '%03d.wav')
+        #if segment_filename already exists, skip it
+        if continue_job and os.path.exists(segment_filename):
+            extracted_segments.append((segment_filename, seg_type, start, end))
+            print(f"[WARNING] Skipping segment {segment_filename} because it already exists")
+            continue
+        ffmpeg_extract_cmd = [
+            'ffmpeg', '-y', '-i', input_file, '-ss', str(start), '-t', str(duration),
+            '-c', 'copy', segment_filename
         ]
-        try:
-            subprocess.run(ffmpeg_split_cmd, check=True, encoding='utf-8')
-            log_message(f"Split completed. Files saved in {output_dir}", log_file=log_file)
-            return True
-        except subprocess.CalledProcessError as e:
-            log_message(f"{SPLIT_FAILED} splitting audio: {e}", level="ERROR", log_file=log_file)
-            return False
-    else:
-        # If no split points were found, copy the entire file
-        output_file = os.path.join(output_dir, '000.wav')
-        ffmpeg_copy_cmd = [
-            'ffmpeg', '-i', input_file, '-c:a', 'pcm_s16le', output_file
-        ]
-        try:
-            subprocess.run(ffmpeg_copy_cmd, check=True, encoding='utf-8')
-            log_message(f"No valid split points found. Copied entire file to {output_file}", log_file=log_file)
-            return True
-        except subprocess.CalledProcessError as e:
-            log_message(f"copying file: {e}", level="ERROR", log_file=log_file)
-            return False
-
-def concat_audio_files(input_file_list, output_path):
-    """
-    Concatenate multiple audio files into a single file.
-
-    Parameters:
-    - input_file_list (list): List of input audio files to concatenate.
-    - output_path (str): Path to save the concatenated audio file.
-
-    Returns:
-    - bool: True if concatenation was successful, False otherwise.
-    """
-    global log_file
-    concat_list_path = os.path.join(os.path.dirname(output_path), f'concat_{os.path.basename(output_path)}.txt')
-    with open(concat_list_path, 'w') as f:
-        for input_file in input_file_list:
-            f.write(f"file '{input_file}'\n")
-
-    ffmpeg_concat_cmd = [
-        'ffmpeg', 
-        #auto confirm overwrite
-        '-y',
-        '-f', 'concat', 
-        #since we use full path, we can use unsafe 0
-        '-safe', '0', 
-        '-i', concat_list_path, 
-        '-c', 'copy', 
-        output_path
-    ]
-    log_message(f'Concatenating audio files: {ffmpeg_concat_cmd}', log_file=log_file)
-    try:
-        subprocess.run(ffmpeg_concat_cmd, check=True, encoding='utf-8')
-    except subprocess.CalledProcessError as e:
-        log_message(f"{CONCAT_FAILED}: {e}", level="ERROR", log_file=log_file)
-        return False
-    log_message(f"Concatenation completed. File saved as {output_path}", log_file=log_file)
-    return True
+        subprocess.run(ffmpeg_extract_cmd, check=True, encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        extracted_segments.append((segment_filename, seg_type, start, end))
+    log_message(f'END segments')
     
-def process_audio(source_path: str, output_path: str, model: str, index_path: str, index_rate: float, f0up_key: int, f0_method: str, gpu: str, support_f16: bool):
-    global log_file
-    cmd = [
-        sys.executable, 'tools/infer_cli.py',
-        '--f0up_key', f'{f0up_key}',
-        '--input_path', source_path,
-        '--model_name', model,
-        '--device', gpu,
-        '--is_half', f'{support_f16}',
-        '--opt_path', output_path,
-        '--f0method', f0_method
-    ]
-    #if not (none or empty)
-    if index_path:
-        cmd.extend([
-            '--index_path', index_path,
-            '--index_rate', f'{index_rate:.2f}'
-        ])
+    return extracted_segments
 
-    log_message(f"Process audio: {' '.join(cmd)}\n", log_file=log_file)
-    p_out = None
-    try:
-        p_out = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8')
-    except subprocess.CalledProcessError as e:
-        log_message(f"{PROCESS_FAILED}: {e}", level="ERROR", log_file=log_file)
-        return False
-    
-    if p_out.returncode != 0:
-        log_message(f"{PROCESS_FAILED}: {p_out.stdout}\n{p_out.stderr}", level="ERROR", log_file=log_file)
-        return False
-    else:
-        log_message(f"processing audio: {p_out.stdout}", log_file=log_file)
+def process_audio_files(input_dir, output_dir, model, index, continue_job=False):
+    supported_extensions = ('.wav', '.mp3')
+    venv_python = sys.executable
 
-    log_message(f'Process audio completed. from {source_path} to {output_path}', log_file=log_file)
-    return True
-
-def process_audio_files(input_dir: str, output_dir: str, model, index_path: str, index_rate: float, splice_size_mb: int):
-    #should be auto detected or manually set
-    f0up_key = 0
-    f0_method = 'rmvpe'
-    #value should be distributed based on the available gpu
-    gpu = 'cuda:0'
-    #should be auto detected based on the gpu
-    support_f16 = True
-    #today for naming
-    today = datetime.datetime.now().strftime('%Y%m%d')
-    #on no index path, set index rate to 0
-    if not index_path:
-        index_rate = 0.0
-
-    has_some_error = False
-    file_map = {}
-
-    #any temp data will be stored here
+    # Create a temporary directory to hold segments.
     temp_dir = os.path.join(output_dir, "temp_segments")
     os.makedirs(temp_dir, exist_ok=True)
-    #for each file in the input directory
-    file_list = os.listdir(input_dir)
-    for i_file, filename in enumerate(file_list):
-        log_message(f"Processing file {i_file + 1}/{len(file_list)}: {filename}", log_file=log_file)
-        #check if file extension is supported
-        is_supported_file = filename.lower().endswith(SUPPORTED_EXTENSION_LIST)
-        if not is_supported_file:
-            continue
-        input_file = os.path.join(input_dir, filename)
-        split_dir = os.path.join(temp_dir, os.path.splitext(filename)[0])
-        os.makedirs(split_dir, exist_ok=True)
 
-        #check if file size larger than splice size
-        file_size = os.path.getsize(input_file) / 1024 / 1024
-        enable_splice = file_size > splice_size_mb
+    # Process each file in the input directory.
+    for filename in os.listdir(input_dir):
+        if filename.lower().endswith(supported_extensions):
+            input_file = os.path.join(input_dir, filename)
+            base_name, _ = os.path.splitext(filename)
+            
+            # Create a subdirectory for segments from this file.
+            file_temp_dir = os.path.join(temp_dir, base_name)
+            os.makedirs(file_temp_dir, exist_ok=True)
+            
+            # Split the file into silence and non-silence segments.
+            segments = split_audio_into_segments(
+                input_file, file_temp_dir, noise_threshold=-30, silence_duration=1, continue_job=continue_job
+            )
+            
+            # Process each segment accordingly.
+            # Batch process all non-silence segments at once using the new CLI
+            env_python = sys.executable
+            processed_dir = os.path.join(file_temp_dir, "processed_segments")
+            os.makedirs(processed_dir, exist_ok=True)
+            # Move all silence-only segments directly into processed_dir
+            for filename in os.listdir(file_temp_dir):
+                if '_silence' in filename and '_non_silence' not in filename:
+                    src = os.path.join(file_temp_dir, filename)
+                    dst = os.path.join(processed_dir, filename)
+                    shutil.move(src, dst)
 
-        # Split based on silence and limit maximum segment duration
-        success = split_audio_on_silence(
-            input_file=input_file,
-            output_dir=split_dir,
-            enable=enable_splice
-        )
-        if not success:
-            log_message(f"Audio splitting failed on File {filename}. SKIP", level="WARNING", log_file=log_file)
-            has_some_error = True
-            file_map[filename] = SPLIT_FAILED
-            continue
+            cmd = [
+                venv_python, "tools/infer_cli_dir.py",
+                "--sid", "0",
+                "--dir_path", file_temp_dir,
+                "--opt_path", processed_dir,
+                "--model_name", model,
+                "--f0method", "rmvpe",
+                "--index_path", index,
+                "--index2_path", "",
+                "--index_rate", "0.6",
+                "--filter_radius", "3",
+                "--resample_sr", "0",
+                "--rms_mix_rate", "1.0",
+                "--protect", "0.33",
+                "--format", "wav"
+            ]
+            ts = datetime.datetime.now()
+            print(f"[{ts}] Running command: {' '.join(cmd)}")
+            # Run batch inference and capture stderr to log
+            result = subprocess.run(cmd, check=True, encoding='utf-8', stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            # Deduplicate and log output lines
+            if log_file:
+                lines = result.stdout.splitlines() if result.stdout else []
+                # include stderr lines if needed
+                lines += result.stderr.splitlines() if result.stderr else []
+                # dedupe while preserving order
+                seen = set()
+                unique = []
+                for ln in lines:
+                    if ln not in seen:
+                        seen.add(ln)
+                        unique.append(ln)
+                with open(log_file, 'a', encoding='utf-8') as f:
+                    for ln in unique:
+                        f.write(ln + '\n')
+            
+            print(f"renaming .wav.wav to .wav in {processed_dir}")
+            # Fix double .wav extension from infer_cli_dir outputs
+            for fname in os.listdir(processed_dir):
+                if fname.endswith('.wav.wav'):
+                    src = os.path.join(processed_dir, fname)
+                    dst = os.path.join(processed_dir, fname[:-4])
+                    shutil.move(src, dst)
 
-        segment_path_list = []
-        process_success = False
-        #segment is name of segment file
-        for segment in sorted(os.listdir(split_dir)):
-            segment_path = os.path.join(split_dir, segment)
-            output_segment_path = os.path.join(output_dir, f"processed_{segment}")
+            # Build final segment list, copying silence segments as-is
+            final_segments = []
+            for seg_file, seg_type, start, end in segments:
+                basename = os.path.basename(seg_file)
+                processed_seg = os.path.join(processed_dir, basename)
+                if seg_type == 'silence':
+                    continue
+                final_segments.append((processed_seg, start))
 
-            process_success = process_audio(segment_path, output_segment_path, model, index_path, index_rate, f0up_key, f0_method, gpu, support_f16)
-            if not process_success:
-                log_message(f'Processing failed on child file {segment}; parent file {filename}.', level="WARNING", log_file=log_file)
-                break
-            segment_path_list.append(output_segment_path)
-        #end segment if any process failed, discard current file
-        if not process_success:
-            has_some_error = True
-            file_map[filename] = PROCESS_FAILED
-            continue
-        final_output_path = os.path.join(output_dir, f"rvc{today}-{f0_method}-indexrate{index_rate:.2f}-half{support_f16}_" + filename)
-        concat_success = concat_audio_files(segment_path_list, final_output_path)
-        if not concat_success:
-            has_some_error = True
-            log_message(f'Concatenation failed on File {filename}.', level="WARNING", log_file=log_file)
-            file_map[filename] = CONCAT_FAILED
-            continue
-        #store the file map
-        file_map[filename] = final_output_path
+            # Reorder segments by their original start times.
+            final_segments_sorted = sorted(final_segments, key=lambda x: x[1])
+            
+            # Write a concat file for ffmpeg.
+            concat_list = os.path.join(file_temp_dir, "concat.txt")
+            with open(concat_list, 'w') as f:
+                for seg, _ in final_segments_sorted:
+                    f.write(f"file '{seg}'\n")
+            
+            final_output_path = os.path.join(output_dir, f"rvc20241205-rmvpe-indexrate0.6-halftrue__{base_name}.wav")
+            
+            all_segments = [seg for seg, _ in final_segments_sorted]
 
-    shutil.rmtree(temp_dir)
-    #remove the processed_ files from output directory
-    for filename in os.listdir(output_dir):
-        if filename.startswith("processed_"):
-            os.remove(os.path.join(output_dir, filename))
+            batch_concat_python(all_segments, final_output=final_output_path)
 
-    #print file map as {key} => {value}\n
-    file_map_str = "".join([f"{k}\n\t=> {v}\n" for k, v in file_map.items()])
-    sys.stdout.buffer.writelines([
-        '************************************\n'.encode('utf-8'),
-        f"File map:\n\n{file_map_str}".encode('utf-8'),
-        '************************************\n'.encode('utf-8')
-    ])
+def batch_concat_python(files, final_output):
+    """
+    Concatenate and mix segments precisely using pydub AudioSegment.
+    Files should be named with start times encoded (e.g., _start_end.wav).
+    """
+    # Regex to extract start time (seconds)
+    re_time = re.compile(r'_(\d+\.?\d*)_\d+\.?\d*\.wav$')
+    segments = []  # (start_ms, AudioSegment)
 
-    return not has_some_error
+    # Load segments and schedule overlays
+    max_end = 0
+    for f in files:
+        m = re_time.search(os.path.basename(f))
+        start_sec = float(m.group(1)) if m else 0.0
+        audio = AudioSegment.from_file(f)
+        start_ms = int(start_sec * 1000)
+        end_ms = start_ms + len(audio)
+        if end_ms > max_end:
+            max_end = end_ms
+        segments.append((start_ms, audio))
+
+    # Create silent base track of required length
+    mixed = AudioSegment.silent(duration=max_end)
+    # Overlay each segment at correct position
+    for start_ms, audio in segments:
+        mixed = mixed.overlay(audio, position=start_ms)
+
+    # Export mixed result
+    mixed.export(final_output, format='wav')
+    print(f"[PYTHON CONCAT] Created {final_output} using pydub mix.")
 
 if __name__ == "__main__":
-    #detect if ffmpeg is installed
-    try:
-        subprocess.run(['ffmpeg', '-version'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, encoding='utf-8')
-    except subprocess.CalledProcessError:
-        raise "FFmpeg is not installed. Please install FFmpeg first."
-
-    parser = argparse.ArgumentParser(description='Process audio files in batch with splitting.')
+    parser = argparse.ArgumentParser(description='Process audio files by splitting into silence and non-silence segments.')
     parser.add_argument('--input_dir', required=True, help="Input directory")
     parser.add_argument('--output_dir', required=True, help="Output directory")
     parser.add_argument('--index_path', help="Path to the index file")
-    parser.add_argument('--index_rate', type=float, default=0.6, help="Index rate")
-    parser.add_argument('--model', required=True, help="Model name")
-    parser.add_argument('--splice_size_mb', type=int, default=0, help="Splice size in MB")
+    parser.add_argument('--model', required=True, help="Name of the model to use")
     parser.add_argument('--log_file', default=LOG_FILE, help="Log")
     args = parser.parse_args()
+
     log_file = args.log_file
 
-    begin_time = datetime.datetime.now()
-    log_message(f"BEGIN {begin_time}\n\tinput_dir: {args.input_dir}; output_dir: {args.output_dir}; index_path: {args.index_path}; index_rate: {args.index_rate}; model: {args.model}; splice_size_mb: {args.splice_size_mb}", log_file=log_file)
-    all_success = process_audio_files(args.input_dir, args.output_dir, args.model, args.index_path, args.index_rate, args.splice_size_mb)
+    # Record start time
+    start_time = datetime.datetime.now()
+    print(f"Processing started at {start_time}")
+
+    process_audio_files(args.input_dir, args.output_dir, args.model, args.index_path, False)
+
+    # Record end time
     end_time = datetime.datetime.now()
-    log_message(f"END {begin_time}-{end_time}\n\tTotal time: {end_time - begin_time}", log_file=log_file)
-    if not all_success:
-        sys.exit(1)
+    print(f"Processing ended at {end_time}, duration: {end_time - start_time}")
