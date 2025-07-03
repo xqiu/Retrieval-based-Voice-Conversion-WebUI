@@ -252,7 +252,22 @@ def refresh_model_list(current_value):
     #use this if 4.x.x or latter
     #return gr.Dropdown(choices=d, value=current_value)
 
-def update_success_status(success):
+def on_infer_button_click():
+    """right after button clicked, change ui status
+
+    Returns:
+        status of changed ui elements
+    """
+    return gr.update(visible=False), gr.update(visible=False)
+
+def handle_infer_ui_result(success):
+    """
+    Handle the result of the inference UI operation.
+    
+    :param success: Boolean indicating if the operation was successful.
+    :param result: The output message from the operation.
+    :return: Tuple of updates for success and error spans, and the result text area.
+    """
     print(f'try update success as {success}, {not success}')
     return gr.update(visible=success), gr.update(visible=not success)
 
@@ -323,6 +338,7 @@ with gr.Blocks() as webapp:
         index = gr.Textbox(label=_("Index"), interactive=True, value=preferences.get_index())
         browse_button = gr.Button(value=_("Browse"))
         browse_button.click(
+            #default folder is RVC_PATH/assets/weights
             fn=lambda: open_select_file_dialog("index", RVC_PATH),
             inputs=[],
             outputs=index
@@ -339,16 +355,19 @@ with gr.Blocks() as webapp:
         is_success = gr.Checkbox(visible=False)
         with gr.Column(scale=4):
             result = gr.TextArea(label=_("Command Output"), value="", interactive=False)
-        is_success.change(
-            fn=update_success_status,
-            inputs=[is_success],
-            outputs=[success_span, error_span]
-        )
     
     run_button.click(
+        fn=on_infer_button_click,
+        inputs=[],
+        outputs=[success_span, error_span]
+    ).then(
         fn=infer_ui,
         inputs=[source, output, model, index],
         outputs=[is_success, result],
+    ).then(
+        fn=handle_infer_ui_result,
+        inputs=[is_success],
+        outputs=[success_span, error_span]
     )
 print(currentI18n["ProgramRunningPleaseDontClose"])
 webapp.launch(share=args.public_web, server_port=args.port, inbrowser=True)
