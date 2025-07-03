@@ -10,16 +10,12 @@ import shlex
 from pydub import AudioSegment
 
 RVC_PATH = os.path.dirname(os.path.realpath(__file__))
-#python path is assigned by conda
-VENV_PATH = sys.executable
-#this is default log file
 LOG_FILE = os.path.join(RVC_PATH, "run_infer.log")
 log_file = None
-#BEGIN ERROR CODE
-SPLIT_FAILED = "SPLIT_FAILED"
-PROCESS_FAILED = "PROCESS_FAILED"
-CONCAT_FAILED = "CONCAT_FAILED"
-#END ERROR CODE
+
+# (Optional) Duration constraints—you may use them later if needed.
+MIN_SEGMENT_DURATION = 120  # 2 minutes
+MAX_SEGMENT_DURATION = 180  # 3 minutes
 
 def log_message(message, level="INFO"):
     global log_file
@@ -28,7 +24,7 @@ def log_message(message, level="INFO"):
         print(f"[WARNING] using default log file: {log_file}")
     with open(log_file, "a", encoding='utf-8') as log_fd:
         log_fd.write(f"[{level}] {message}\n")
-
+        
 def safe_print(message):
     """Prints a message to the console, ensuring it is safe for all environments."""
     try:
@@ -37,26 +33,6 @@ def safe_print(message):
         sys.stdout.reconfigure(encoding='utf-8')
         # If there's an encoding error, replace problematic characters
         print(message.encode('utf-8', errors='replace').decode('utf-8', errors='replace'))
-
-#BEGIN CONSTANT
-
-# Minimum segment duration in seconds
-DEFAULT_MIN_SEGMENT_DURATION = 120
-# Maximum segment duration in seconds
-DEFAULT_MAX_SEGMENT_DURATION = 180
-# Noise threshold in dB
-DEFAULT_NOISE_THRESHOLD = -50
-# Minimum silence duration in seconds
-DEFAULT_SILENCE_DURATION = 0.5
-
-DEFAULT_CONCAT_BATCH_SIZE = 100
-
-SEGMENT_SILENCE = 'silence'
-SEGMENT_NON_SILENCE = 'non_silence'
-
-SUPPORTED_EXTENSION_LIST = ('.wav', '.mp3')
-
-#END CONSTANT
 
 def get_audio_detail(input_file):
     """_summary_
@@ -118,7 +94,7 @@ def append_silence(input_file: str, append_duration: float, sample_rate: int, ch
         save_print(f"[WARNING] Skipping appending silence to {input_file} because {output_file} already exists")
         return output_file
     
-    log_message(f'append silence to {input_file} by {append_duration} seconds', log_file=log_file)
+    log_message(f'append silence to {input_file} by {append_duration} seconds')
     ffmpeg_silence_cmd = [
         'ffmpeg', '-y', '-i', input_file, '-f', 'lavfi', '-t', str(append_duration), '-i', f'anullsrc=channel_layout={channel}:sample_rate={sample_rate}', '-filter_complex', '[0][1]concat=n=2:v=0:a=1', output_file
     ]
@@ -188,14 +164,14 @@ def split_audio_into_segments(input_file: str, temp_dir: str, noise_threshold=-3
         #     adjust_silence_end -= 0.1
         # If there is audio before this silence, add it as a non-silence segment.
         if adjust_silence_start > current_time:
-            segments.append((current_time, adjust_silence_start, SEGMENT_NON_SILENCE))
+            segments.append((current_time, adjust_silence_start, 'non_silence'))
         # Add the silence segment.
-        segments.append((adjust_silence_start, adjust_silence_end, SEGMENT_SILENCE))
+        segments.append((adjust_silence_start, adjust_silence_end, 'silence'))
         current_time = adjust_silence_end
     log_message(f'END RAW silence_intervals')
     # If there is audio after the last silence, add it.
     if current_time < total_duration:
-        segments.append((current_time, total_duration, SEGMENT_NON_SILENCE))
+        segments.append((current_time, total_duration, 'non_silence'))
 
     # Extract each segment to its own file.
     extracted_segments = []
