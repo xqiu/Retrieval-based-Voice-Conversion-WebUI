@@ -17,14 +17,18 @@ log_file = None
 MIN_SEGMENT_DURATION = 120  # 2 minutes
 MAX_SEGMENT_DURATION = 180  # 3 minutes
 
-def log_message(message, level="INFO"):
+DEFAULT_PADDING_AUDIO_LENGTH = 0.5 # 0.5 seconds
+
+def log_message(message, level="INFO", printthis: bool = True):
     global log_file
     if log_file is None:
         log_file = LOG_FILE
         print(f"[WARNING] using default log file: {log_file}")
     with open(log_file, "a", encoding='utf-8') as log_fd:
         log_fd.write(f"[{level}] {message}\n")
-        
+    if printthis:
+        safe_print(f"[{level}] {message}")
+
 def safe_print(message):
     """Prints a message to the console, ensuring it is safe for all environments."""
     try:
@@ -64,7 +68,7 @@ def get_audio_detail(input_file):
         # 7.1 if 8
         channel_str = 'mono' if channel == '1' else 'stereo' if channel == '2' else '5.1' if channel == '6' else '7.1' if channel == '8' else 'unknown'
 
-        log_message(f"get_audio_detail {input_file} => \n\tduration: {duration}, \n\tsample_rate: {sample_rate}, \n\tchannel: {channel}")
+        log_message(f"get_audio_detail {input_file} => \n\tduration: {duration}, \n\tsample_rate: {sample_rate}, \n\tchannel: {channel}", printthis=False)
 
         return float(duration), int(sample_rate), channel_str
     except (subprocess.CalledProcessError, ValueError) as e:
@@ -82,7 +86,7 @@ def append_silence(input_file: str, append_duration: float, sample_rate: int, ch
     Returns:
         str: output file path (if fail will return same path as input_file)
     """
-    log_message(f'append silence to {input_file} by {append_duration} seconds')
+    log_message(f'append silence to {input_file} by {append_duration} seconds', printthis=False)
     # output file name = input file name appended with '_append'
     output_file = input_file
     if '.wav' in input_file:
@@ -91,20 +95,48 @@ def append_silence(input_file: str, append_duration: float, sample_rate: int, ch
     #if output_file already exists, skip it
     if continue_job and os.path.exists(output_file):
         log_message(f"Skipping appending silence to {input_file} because {output_file} already exists", level='WARNING')
-        save_print(f"[WARNING] Skipping appending silence to {input_file} because {output_file} already exists")
         return output_file
     
-    log_message(f'append silence to {input_file} by {append_duration} seconds')
+    log_message(f'append silence to {input_file} by {append_duration} seconds', printthis=False)
     ffmpeg_silence_cmd = [
         'ffmpeg', '-y', '-i', input_file, '-f', 'lavfi', '-t', str(append_duration), '-i', f'anullsrc=channel_layout={channel}:sample_rate={sample_rate}', '-filter_complex', '[0][1]concat=n=2:v=0:a=1', output_file
     ]
     try: 
         subprocess.run(ffmpeg_silence_cmd, check=True, encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except subprocess.CalledProcessError as e:
-        log_message(f"[Error] appending silence: {e}")
+        log_message(f"[Error] appending silence: {e}", level="ERROR")
         return input_file
 
     return output_file
+
+def padding_audio(input_file: str, output_file: str, padding_duration: float = DEFAULT_PADDING_AUDIO_LENGTH):
+    """
+    Adds silence before and after the input WAV file using ffmpeg.
+
+    Args:
+        input_file (str): Path to the input WAV file.
+        output_file (str): Path to the output WAV file.
+        padding_duration (float): Duration of silence to add before and after (in seconds).
+    """
+    # Get audio details for sample rate and channel layout
+    duration, sample_rate, channel_str = get_audio_detail(input_file)
+
+    # ffmpeg command to add silence before and after
+    ffmpeg_cmd = [
+        'ffmpeg', '-y',
+        '-f', 'lavfi', '-t', str(padding_duration),
+        '-i', f'anullsrc=channel_layout={channel_str}:sample_rate={sample_rate}',
+        '-i', input_file,
+        '-f', 'lavfi', '-t', str(padding_duration),
+        '-i', f'anullsrc=channel_layout={channel_str}:sample_rate={sample_rate}',
+        '-filter_complex', '[0][1][2]concat=n=3:v=0:a=1',
+        output_file
+    ]
+    try:
+        subprocess.run(ffmpeg_cmd, check=True, encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        log_message(f"Added {padding_duration}s silence before and after {input_file} -> {output_file}", printthis=False)
+    except subprocess.CalledProcessError as e:
+        log_message(f"[Error] padding_audio: {e}", level="ERROR")
 
 def split_audio_into_segments(input_file: str, temp_dir: str, noise_threshold=-30, silence_duration=1, continue_job=False):
     """
@@ -142,14 +174,14 @@ def split_audio_into_segments(input_file: str, temp_dir: str, noise_threshold=-3
         '-of', 'default=noprint_wrappers=1:nokey=1', input_file
     ]
     total_duration = float(subprocess.run(duration_cmd, stdout=subprocess.PIPE, text=True, check=True).stdout.strip())
-    log_message(f'BEGIN file => {input_file}')
-    log_message(f'\t=> total_duration: {total_duration}')
+    log_message(f'BEGIN file => {input_file}', printthis=False)
+    log_message(f'\t=> total_duration: {total_duration}', printthis=False)
     # Create segments: non-silence segments are between silence intervals.
     segments = []  # Each element is (start_time, end_time, segment_type)
     current_time = 0.0
-    log_message(f'BEGIN RAW silence_intervals')
+    log_message(f'BEGIN RAW silence_intervals', printthis=False)
     for (silence_start, silence_end) in silence_intervals:
-        log_message(f'{silence_start}\t{silence_end}')
+        log_message(f'{silence_start}\t{silence_end}', printthis=False)
         adjust_silence_start = silence_start
         adjust_silence_end = silence_end
         #adjust silence_start and silence_end
@@ -168,27 +200,26 @@ def split_audio_into_segments(input_file: str, temp_dir: str, noise_threshold=-3
         # Add the silence segment.
         segments.append((adjust_silence_start, adjust_silence_end, 'silence'))
         current_time = adjust_silence_end
-    log_message(f'END RAW silence_intervals')
+    log_message(f'END RAW silence_intervals', printthis=False)
     # If there is audio after the last silence, add it.
     if current_time < total_duration:
         segments.append((current_time, total_duration, 'non_silence'))
 
     # Extract each segment to its own file.
     extracted_segments = []
-    log_message(f'BEGIN segments')
+    log_message(f'BEGIN segments', printthis=False)
     for idx, (start, end, seg_type) in enumerate(segments):
-        log_message(f'{start}\t{end}\t{seg_type}')
+        log_message(f'{start}\t{end}\t{seg_type}', printthis=False)
         duration = end - start
         if(duration < 0.05):
-            safe_print(f"[WARNING] Skipping short segment of file {input_file}:\n\t {start}-{end} ({duration}s)")
-            log_message(f"[WARNING] Skipping short segment of file {input_file}:\n\t {start}-{end} ({duration}s)")
+            log_message(f"Skipping short segment of file {input_file}:\n\t {start}-{end} ({duration}s)", level="WARNING")
             continue
         segment_filename = os.path.join(temp_dir, f"{idx:04d}_{seg_type}_{start}_{end}.wav")
 
         #if segment_filename already exists, skip it
         if continue_job and os.path.exists(segment_filename):
             extracted_segments.append((segment_filename, seg_type, start, end))
-            safe_print(f"[WARNING] Skipping segment {segment_filename} because it already exists")
+            log_message(f"Skipping segment {segment_filename} because it already exists", level="WARNING")
             continue
         ffmpeg_extract_cmd = [
             'ffmpeg', '-y', '-i', input_file, '-ss', str(start), '-t', str(duration),
@@ -196,7 +227,7 @@ def split_audio_into_segments(input_file: str, temp_dir: str, noise_threshold=-3
         ]
         subprocess.run(ffmpeg_extract_cmd, check=True, encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         extracted_segments.append((segment_filename, seg_type, start, end))
-    log_message(f'END segments')
+    log_message(f'END segments', printthis=False)
     
     return extracted_segments
 
@@ -225,15 +256,25 @@ def process_audio_files(input_dir, output_dir, model, index, continue_job=False)
             
             # Process each segment accordingly.
             # Batch process all non-silence segments at once using the new CLI
-            env_python = sys.executable
+            preprocess_file_list = os.listdir(file_temp_dir)
             processed_dir = os.path.join(file_temp_dir, "processed_segments")
             os.makedirs(processed_dir, exist_ok=True)
+            non_silence_original_dir = os.path.join(file_temp_dir, "non_silence_original")
+            os.makedirs(non_silence_original_dir, exist_ok=True)
             # Move all silence-only segments directly into processed_dir
-            for filename in os.listdir(file_temp_dir):
+            for filename in preprocess_file_list:
+                log_message(f"preprocess file: {filename} of {file_temp_dir}", printthis=False)
                 if '_silence' in filename and '_non_silence' not in filename:
                     src = os.path.join(file_temp_dir, filename)
                     dst = os.path.join(processed_dir, filename)
                     shutil.move(src, dst)
+                else:
+                    # for non-silence segments, move them to non_silence_original
+                    src = os.path.join(file_temp_dir, filename)
+                    dst = os.path.join(non_silence_original_dir, filename)
+                    shutil.move(src, dst)
+                    #append silence part via padding_audio
+                    padding_audio(dst, src)
 
             cmd = [
                 venv_python, "tools/infer_cli_dir.py",
@@ -252,7 +293,7 @@ def process_audio_files(input_dir, output_dir, model, index, continue_job=False)
                 "--format", "wav"
             ]
             ts = datetime.datetime.now()
-            safe_print(f"[{ts}] Running command: {' '.join(cmd)}")
+            log_message(f"[{ts}] Running command: {' '.join(cmd)}")
             # Run batch inference and capture stderr to log
             result = subprocess.run(cmd, check=True, encoding='utf-8', stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             # Deduplicate and log output lines
@@ -271,7 +312,7 @@ def process_audio_files(input_dir, output_dir, model, index, continue_job=False)
                     for ln in unique:
                         f.write(ln + '\n')
             
-            safe_print(f"renaming .wav.wav to .wav in {processed_dir}")
+            log_message(f"renaming .wav.wav to .wav in {processed_dir}")
             # Fix double .wav extension from infer_cli_dir outputs
             for fname in os.listdir(processed_dir):
                 if fname.endswith('.wav.wav'):
@@ -332,7 +373,7 @@ def batch_concat_python(files, final_output):
 
     # Export mixed result
     mixed.export(final_output, format='wav')
-    safe_print(f"[PYTHON CONCAT] Created {final_output} using pydub mix.")
+    log_message(f"[PYTHON CONCAT] Created {final_output} using pydub mix.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Process audio files by splitting into silence and non-silence segments.')
@@ -348,11 +389,9 @@ if __name__ == "__main__":
     # Record start time
     start_time = datetime.datetime.now()
     log_message(f"Processing started at {start_time}")
-    safe_print(f"Processing started at {start_time}")
 
     process_audio_files(args.input_dir, args.output_dir, args.model, args.index_path, False)
 
     # Record end time
     end_time = datetime.datetime.now()
     log_message(f"Processing ended at {end_time}, duration: {end_time - start_time}")
-    safe_print(f"Processing ended at {end_time}, duration: {end_time - start_time}")
