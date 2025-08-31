@@ -91,7 +91,7 @@ def append_silence(input_file: str, append_duration: float, sample_rate: int, ch
     #if output_file already exists, skip it
     if continue_job and os.path.exists(output_file):
         log_message(f"Skipping appending silence to {input_file} because {output_file} already exists", level='WARNING')
-        save_print(f"[WARNING] Skipping appending silence to {input_file} because {output_file} already exists")
+        safe_print(f"[WARNING] Skipping appending silence to {input_file} because {output_file} already exists")
         return output_file
     
     log_message(f'append silence to {input_file} by {append_duration} seconds')
