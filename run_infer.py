@@ -318,6 +318,9 @@ def process_audio_files(input_dir, output_dir, model, index, continue_job=False)
 
             batch_concat_python(all_segments, final_output=final_output_path)
 
+    # remove temp_dir
+    shutil.rmtree(temp_dir)
+
 def batch_concat_python(files, final_output):
     """
     Concatenate and mix segments precisely using pydub AudioSegment.
