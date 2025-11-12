@@ -140,19 +140,45 @@ def padding_audio(input_file: str, output_file: str, padding_duration: float = D
     except subprocess.CalledProcessError as e:
         log_message(f"[Error] padding_audio: {e}", level="ERROR")
 
-def split_audio_into_segments(input_file: str, temp_dir: str, noise_threshold=-30, silence_duration=1, continue_job=False):
+def split_audio_into_segments(input_file: str, temp_dir: str, noise_threshold=-20, silence_duration=1.5, continue_job=False, padding_sec=0.1):
     """
     Splits the input audio file into segments labeled as 'silence' and 'non_silence'
     using ffmpeg's silencedetect filter.
     
-    Returns a list of tuples: (segment_file, segment_type, start_time, end_time)
+    Args:
+        input_file (str): Path to the input audio file (wav or mp3).
+        temp_dir (str): Directory to store the extracted segments.
+        noise_threshold (int): Silence threshold in dB.
+        silence_duration (float): Minimum duration of silence to detect in seconds.
+        continue_job (bool): If True, skips processing segments that already exist.
+        padding_sec (float): Padding duration in seconds to add around non-silence segments.
+
+    Returns:
+        tuples: (segment_file, segment_type, start_time, end_time)
+
+    Example:
+    noise_threshold, silence_duration, Expected Behavior
+    * -40dB, d=0.5	Very aggressive: Cuts on very small gaps, even if there’s low noise.
+    * -30dB, d=1	Moderate (your current setting): Good for clean recordings, but can overcut in noisy ones.
+    * -25dB, d=2	More tolerant: Best if your audio has background hum or short pauses.
+    * -20dB, d=3	Very tolerant: Cuts only on long, obvious silence.
     """
-    log_message(f'RUN get file silence intervals: {input_file}', printthis=False)
+    # Get total duration of the input file.
+    duration_cmd = [
+        'ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+        '-of', 'default=noprint_wrappers=1:nokey=1', input_file
+    ]
+    log_message(f'RUN get file duration: {input_file}', printthis=False)
+    total_duration = float(subprocess.run(duration_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8').stdout.strip())
+    log_message(f'BEGIN file => {input_file}', printthis=False)
+    log_message(f'\t=> total_duration: {total_duration}', printthis=False)
+
     # Run ffmpeg silencedetect to get silence intervals.
     silence_cmd = [
         'ffmpeg', '-i', input_file, '-af',
         f'silencedetect=noise={noise_threshold}dB:d={silence_duration}', '-f', 'null', '-'
     ]
+    log_message(f'RUN get file silence intervals: {input_file}', printthis=False)
     result = subprocess.run(silence_cmd, stderr=subprocess.PIPE, text=True, check=True, encoding='utf-8')
     
     # Parse the stderr output to get pairs of silence_start and silence_end.
@@ -167,18 +193,16 @@ def split_audio_into_segments(input_file: str, temp_dir: str, noise_threshold=-3
             match = re.search(r'silence_end: (\d+\.?\d*)', line)
             if match:
                 silence_end = float(match.group(1))
-                silence_intervals.append((current_silence_start, silence_end))
+                real_silence_start = current_silence_start + padding_sec
+                if(real_silence_start < 0 ):
+                    real_silence_start = 0
+                real_silence_end = silence_end - padding_sec
+                if(real_silence_end > total_duration):
+                    real_silence_end = total_duration
+
+                silence_intervals.append((real_silence_start, real_silence_end))
                 current_silence_start = None
 
-    # Get total duration of the input file.
-    duration_cmd = [
-        'ffprobe', '-v', 'error', '-show_entries', 'format=duration',
-        '-of', 'default=noprint_wrappers=1:nokey=1', input_file
-    ]
-    log_message(f'RUN get file duration: {input_file}', printthis=False)
-    total_duration = float(subprocess.run(duration_cmd, stdout=subprocess.PIPE, text=True, check=True, encoding='utf-8').stdout.strip())
-    log_message(f'BEGIN file => {input_file}', printthis=False)
-    log_message(f'\t=> total_duration: {total_duration}', printthis=False)
     # Create segments: non-silence segments are between silence intervals.
     segments = []  # Each element is (start_time, end_time, segment_type)
     current_time = 0.0
@@ -258,7 +282,7 @@ def process_audio_files(input_dir, output_dir, model, index, continue_job=False)
             
             # Split the file into silence and non-silence segments.
             segments = split_audio_into_segments(
-                input_file, file_temp_dir, noise_threshold=-30, silence_duration=1, continue_job=continue_job
+                input_file, file_temp_dir, noise_threshold=-20, silence_duration=1.5, continue_job=continue_job, padding_sec=0.1
             )
             
             # Process each segment accordingly.
@@ -373,6 +397,9 @@ def process_audio_files(input_dir, output_dir, model, index, continue_job=False)
             all_segments = [seg for seg, _ in final_segments_sorted]
 
             batch_concat_python(all_segments, final_output=final_output_path)
+
+    # remove temp_dir
+    shutil.rmtree(temp_dir)
 
 def batch_concat_python(files, final_output):
     """
