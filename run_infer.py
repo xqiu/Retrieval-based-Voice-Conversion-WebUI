@@ -228,16 +228,16 @@ def split_audio_into_segments(input_file: str, temp_dir: str, noise_threshold=-2
     
     return extracted_segments
 
-def process_audio_files(input_dir, output_dir, model, index, continue_job=False):
-    # please move index2 path as parameter if you need it later
+def process_audio_files(input_dir, output_dir, model, index, index_rate=0.6, protect=0.33, continue_job=False):
     index2 = ""
-
     supported_extensions = ('.wav', '.mp3')
     venv_python = sys.executable
 
     # Create a temporary directory to hold segments.
     temp_dir = os.path.join(output_dir, "temp_segments")
     os.makedirs(temp_dir, exist_ok=True)
+
+    half_true = True  # Use half precision for faster processing if supported.
 
     # Process each file in the input directory.
     for filename in os.listdir(input_dir):
@@ -276,10 +276,14 @@ def process_audio_files(input_dir, output_dir, model, index, continue_job=False)
                 "--opt_path", processed_dir,
                 "--model_name", model,
                 "--f0method", "rmvpe",
+                "--index_path", index if index else "",
+                "--index2_path", "",
+                "--index_rate", str(index_rate),
                 "--filter_radius", "3",
                 "--resample_sr", "0",
                 "--rms_mix_rate", "1.0",
-                "--protect", "0.33",
+                "--protect", str(protect),
+                "--is_half", "True" if half_true else "False",
                 "--format", "wav"
             ]
             # only add index parameters if they are provided
@@ -316,12 +320,8 @@ def process_audio_files(input_dir, output_dir, model, index, continue_job=False)
                 with open(log_file, 'a', encoding='utf-8') as f:
                     for ln in unique:
                         f.write(ln + '\n')
-            if result.returncode != 0:
-                # due to process failure, rest of the code may not work properly, so we exit here
-                log_message(f"Process failure, exit", level="ERROR")
-                exit(1)
-
-            log_message(f"renaming .wav.wav to .wav in {processed_dir}")
+            
+            #safe_print(f"renaming .wav.wav to .wav in {processed_dir}")
             # Fix double .wav extension from infer_cli_dir outputs
             for fname in os.listdir(processed_dir):
                 if fname.endswith('.wav.wav'):
@@ -350,9 +350,9 @@ def process_audio_files(input_dir, output_dir, model, index, continue_job=False)
             with open(concat_list, 'w', encoding='utf-8') as f:
                 for seg, _ in final_segments_sorted:
                     f.write(f"file '{seg}'\n")
-            
-            final_output_path = os.path.join(output_dir, f"rvc20241205-rmvpe-indexrate0.6-halftrue__{base_name}.wav")
-            
+
+            final_output_path = os.path.join(output_dir, f"rvc20241205-{model}-indexrate{index_rate}-protect{protect}-halftrue__{base_name}.wav")
+
             all_segments = [seg for seg, _ in final_segments_sorted]
 
             batch_concat_python(all_segments, final_output=final_output_path)
@@ -401,6 +401,8 @@ if __name__ == "__main__":
     parser.add_argument('--output_dir', required=True, help="Output directory")
     parser.add_argument('--index_path', help="Path to the index file")
     parser.add_argument('--model', required=True, help="Name of the model to use")
+    parser.add_argument('--index_rate', default=0.6, help="Index retrieval rate (default: 0.6)")
+    parser.add_argument('--protect', default=0.33, help="Protection rate (default: 0.33)")
     parser.add_argument('--log_file', default=LOG_FILE, help="Log")
     args = parser.parse_args()
 
@@ -410,7 +412,7 @@ if __name__ == "__main__":
     start_time = datetime.datetime.now()
     log_message(f"Processing started at {start_time}")
 
-    process_audio_files(args.input_dir, args.output_dir, args.model, args.index_path, False)
+    process_audio_files(args.input_dir, args.output_dir, args.model, args.index_path, args.index_rate, args.protect, False)
 
     # Record end time
     end_time = datetime.datetime.now()

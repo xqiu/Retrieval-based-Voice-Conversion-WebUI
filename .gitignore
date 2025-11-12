@@ -29,3 +29,6 @@ ffprobe.*
 
 /infer_logs/*
 run_infer_preferences.json
+/venv
+/*.cmd
+/*.log

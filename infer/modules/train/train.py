@@ -138,9 +138,16 @@ def run(rank, n_gpus, hps, logger: logging.Logger):
         writer = SummaryWriter(log_dir=hps.model_dir)
         writer_eval = SummaryWriter(log_dir=os.path.join(hps.model_dir, "eval"))
 
-    dist.init_process_group(
-        backend="gloo", init_method="env://", world_size=n_gpus, rank=rank
-    )
+    if(n_gpus > 1):
+        dist.init_process_group(
+            backend="gloo", init_method="env://", world_size=n_gpus, rank=rank
+        )
+    else:
+        # 强制单卡模式
+        world_size = 1
+        rank = 0
+        local_rank = 0
+
     torch.manual_seed(hps.train.seed)
     if torch.cuda.is_available():
         torch.cuda.set_device(rank)
@@ -208,13 +215,21 @@ def run(rank, n_gpus, hps, logger: logging.Logger):
         eps=hps.train.eps,
         weight_decay=hps.train.weight_decay,  # Ensure this parameter is defined
     )
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     # net_g = DDP(net_g, device_ids=[rank], find_unused_parameters=True)
     # net_d = DDP(net_d, device_ids=[rank], find_unused_parameters=True)
     if hasattr(torch, "xpu") and torch.xpu.is_available():
         pass
     elif torch.cuda.is_available():
-        net_g = DDP(net_g, device_ids=[rank])
-        net_d = DDP(net_d, device_ids=[rank])
+        if(n_gpus > 1):
+            net_g = DDP(net_g, device_ids=[rank])
+            net_d = DDP(net_d, device_ids=[rank])
+        else:
+            # === 完全禁用 DDP，用单卡模式 ===
+            net_g = net_g.to(device)
+            net_d = net_d.to(device)
     else:
         net_g = DDP(net_g)
         net_d = DDP(net_d)
@@ -278,6 +293,17 @@ def run(rank, n_gpus, hps, logger: logging.Logger):
 
     # Initialize phoneme_recognizer, using hubert_base_ls960 from https://dl.fbaipublicfiles.com/hubert/hubert_base_ls960.pt
     ckpt_path = "assets/hubert/hubert_base_ls960.pt"
+    
+    # === 修复 PyTorch 2.6+ weights_only 安全限制 ===
+    from torch.serialization import add_safe_globals
+    import argparse
+    from fairseq.data import Dictionary  # 关键！
+
+    # 允许 RVC 模型所需的所有类型
+    add_safe_globals([
+        argparse.Namespace,
+        Dictionary  # fairseq 的字典类
+    ])
 
     # Load model, configuration, and task
     models, cfg, task = load_model_ensemble_and_task([ckpt_path])
@@ -292,7 +318,6 @@ def run(rank, n_gpus, hps, logger: logging.Logger):
     if hps.train.fp16_run:  # Check if mixed-precision is enabled
         phoneme_recognizer = phoneme_recognizer.half()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     phoneme_recognizer.to(device)
 
     # Initializes a VoiceEncoder instance for speaker embedding extraction.
