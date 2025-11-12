@@ -285,19 +285,21 @@ def infer_ui(source: str, output: str, model: str, index: str):
     try:
         print(f"Running command: {' '.join(process_command)}")
         log_message(f"Running command: {' '.join(process_command)}", level="INFO")
-
-        result = subprocess.run(process_command, capture_output=True, text=True, cwd=RVC_PATH, encoding="utf-8")
+        result = subprocess.run(process_command, capture_output=True, text=True, cwd=RVC_PATH, encoding='utf-8')
         if result.returncode != 0:
-            log_message(result.stdout + '\n' + result.stderr, level="ERROR")
-            print(f"Command failed with error: {result.stderr}")
-            return False, result.stdout
+            err_msg = result.stdout if result.stdout else 'NO OUTPUT'
+            err_msg += result.stderr if result.stderr else 'NO ERR OUTPUT'
+
+            log_message(err_msg, level="ERROR")
+            print(f"Command failed with error: {err_msg}")
+            return False, err_msg
         else:
             log_message(result.stdout, level="INFO")
             print(f"Command executed successfully: {result.stdout}")
             return True, result.stdout
     except Exception as e:
         log_message(str(e), level="ERROR")
-        print(f"Error running command: {str(e)}")
+        print(f"Command failed with error: {str(e)}")
         return False, str(e)
 
 # Initialize preferences
