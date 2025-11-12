@@ -17,8 +17,6 @@ log_file = None
 MIN_SEGMENT_DURATION = 120  # 2 minutes
 MAX_SEGMENT_DURATION = 180  # 3 minutes
 
-DEFAULT_PADDING_AUDIO_LENGTH = 0.5 # 0.5 seconds
-
 def log_message(message, level="INFO", printthis: bool = True):
     global log_file
     if log_file is None:
@@ -110,36 +108,6 @@ def append_silence(input_file: str, append_duration: float, sample_rate: int, ch
 
     return output_file
 
-def padding_audio(input_file: str, output_file: str, padding_duration: float = DEFAULT_PADDING_AUDIO_LENGTH):
-    """
-    Adds silence before and after the input WAV file using ffmpeg.
-
-    Args:
-        input_file (str): Path to the input WAV file.
-        output_file (str): Path to the output WAV file.
-        padding_duration (float): Duration of silence to add before and after (in seconds).
-    """
-    # Get audio details for sample rate and channel layout
-    duration, sample_rate, channel_str = get_audio_detail(input_file)
-
-    # ffmpeg command to add silence before and after
-    ffmpeg_cmd = [
-        'ffmpeg', '-y',
-        '-f', 'lavfi', '-t', str(padding_duration),
-        '-i', f'anullsrc=channel_layout={channel_str}:sample_rate={sample_rate}',
-        '-i', input_file,
-        '-f', 'lavfi', '-t', str(padding_duration),
-        '-i', f'anullsrc=channel_layout={channel_str}:sample_rate={sample_rate}',
-        '-filter_complex', '[0][1][2]concat=n=3:v=0:a=1',
-        output_file
-    ]
-    log_message(f'RUN padding duration: {input_file}', printthis=True)
-    try:
-        subprocess.run(ffmpeg_cmd, check=True, encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        log_message(f"Added {padding_duration}s silence before and after {input_file} -> {output_file}", printthis=False)
-    except subprocess.CalledProcessError as e:
-        log_message(f"[Error] padding_audio: {e}", level="ERROR")
-
 def split_audio_into_segments(input_file: str, temp_dir: str, noise_threshold=-20, silence_duration=1.5, continue_job=False, padding_sec=0.1):
     """
     Splits the input audio file into segments labeled as 'silence' and 'non_silence'
@@ -169,7 +137,7 @@ def split_audio_into_segments(input_file: str, temp_dir: str, noise_threshold=-2
         '-of', 'default=noprint_wrappers=1:nokey=1', input_file
     ]
     log_message(f'RUN get file duration: {input_file}', printthis=False)
-    total_duration = float(subprocess.run(duration_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8').stdout.strip())
+    total_duration = float(subprocess.run(duration_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', check=True).stdout.strip())
     log_message(f'BEGIN file => {input_file}', printthis=False)
     log_message(f'\t=> total_duration: {total_duration}', printthis=False)
 
@@ -193,6 +161,7 @@ def split_audio_into_segments(input_file: str, temp_dir: str, noise_threshold=-2
             match = re.search(r'silence_end: (\d+\.?\d*)', line)
             if match:
                 silence_end = float(match.group(1))
+
                 real_silence_start = current_silence_start + padding_sec
                 if(real_silence_start < 0 ):
                     real_silence_start = 0
@@ -292,8 +261,6 @@ def process_audio_files(input_dir, output_dir, model, index, continue_job=False)
             preprocess_file_list = [f for f in preprocess_file_list if f.lower().endswith(supported_extensions)]
             processed_dir = os.path.join(file_temp_dir, "processed_segments")
             os.makedirs(processed_dir, exist_ok=True)
-            non_silence_original_dir = os.path.join(file_temp_dir, "non_silence_original")
-            os.makedirs(non_silence_original_dir, exist_ok=True)
             # Move all silence-only segments directly into processed_dir
             for filename in preprocess_file_list:
                 log_message(f"preprocess file: {filename} of {file_temp_dir}", printthis=False)
@@ -301,14 +268,6 @@ def process_audio_files(input_dir, output_dir, model, index, continue_job=False)
                     src = os.path.join(file_temp_dir, filename)
                     dst = os.path.join(processed_dir, filename)
                     shutil.move(src, dst)
-                else:
-                    # for non-silence segments, move them to non_silence_original
-                    src = os.path.join(file_temp_dir, filename)
-                    dst = os.path.join(non_silence_original_dir, filename)
-                    shutil.move(src, dst)
-                    log_message(f"moved non_silence segment from {src} to {dst}", printthis=True)
-                    #append silence part via padding_audio
-                    padding_audio(dst, src)
 
             cmd = [
                 venv_python, "tools/infer_cli_dir.py",
